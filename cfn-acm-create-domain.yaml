@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Request ACM certificate with DNS validation
+
+Parameters:
+  DomainName:
+    Type: String
+
+Resources:
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub 'www.${DomainName}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          ValidationDomain: !Ref DomainName
+        - DomainName: !Sub 'www.${DomainName}'
+          ValidationDomain: !Ref DomainName
+      Tags:
+        - Key: Name
+          Value: !Sub 'ACM Certificate for ${DomainName}'
+
+Outputs:
+  CertificateArn:
+    Description: ARN of the ACM certificate
+    Value: !Ref Certificate

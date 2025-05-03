@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda to deploy static site to S3 from GitHub webhook
+
+Parameters:
+  GitHubRepoUrl:
+    Type: String
+    Description: GitHub repo archive URL (e.g., https://github.com/user/repo/archive/refs/heads/main.zip)
+  GitHubToken:
+    Type: String
+    Description: GitHub Personal Access Token (stored securely)
+    NoEcho: true
+  TargetS3Bucket:
+    Type: String
+    Description: The name of the target S3 bucket (must already exist)
+
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3Write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub arn:aws:s3:::${TargetS3Bucket}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  GitHubDeployFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GitHubDeployToS3
+      Runtime: python3.12
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          GITHUB_ZIP_URL: !Ref GitHubRepoUrl
+          GITHUB_TOKEN: !Ref GitHubToken
+          TARGET_BUCKET: !Ref TargetS3Bucket
+      Code:
+        ZipFile: |
+          import os, json, zipfile, io, urllib.request, boto3, mimetypes
+
+          def lambda_handler(event, context):
+              print("Event:", json.dumps(event))
+              headers = event.get("headers", {})
+              if "X-GitHub-Event" in headers and headers["X-GitHub-Event"] != "push":
+                  return { "statusCode": 200, "body": "Not a push event" }
+
+              zip_url = os.environ["GITHUB_ZIP_URL"]
+              token = os.environ["GITHUB_TOKEN"]
+              bucket = os.environ["TARGET_BUCKET"]
+
+              # Download ZIP from GitHub
+              req = urllib.request.Request(zip_url)
+              req.add_header("Authorization", f"token {token}")
+              with urllib.request.urlopen(req) as resp:
+                  zip_data = resp.read()
+
+              # Extract ZIP and upload all files to S3
+              with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+                  s3 = boto3.client("s3")
+                  root_folder = z.namelist()[0]  # usually repo-main/
+
+                  for file_path in z.namelist():
+                      if file_path.endswith("/"):
+                          continue  # skip directories
+
+                      content = z.read(file_path)
+                      dest_key = file_path.replace(root_folder, "", 1)
+
+                      content_type, _ = mimetypes.guess_type(dest_key)
+                      content_type = content_type or "application/octet-stream"
+
+                      print(f"Uploading {dest_key} with Content-Type: {content_type}")
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=dest_key,
+                          Body=content,
+                          ContentType=content_type
+                      )
+
+              return { "statusCode": 200, "body": "Deployed all files to S3" }
+
+  GitHubWebhookAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: GitHubWebhookAPI
+
+  GitHubWebhookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref GitHubWebhookAPI
+      ParentId: !GetAtt GitHubWebhookAPI.RootResourceId
+      PathPart: webhook
+
+  GitHubWebhookMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref GitHubWebhookAPI
+      ResourceId: !Ref GitHubWebhookResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - Region: !Ref AWS::Region
+            LambdaArn: !GetAtt GitHubDeployFunction.Arn
+
+  GitHubWebhookDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: GitHubWebhookMethod
+    Properties:
+      RestApiId: !Ref GitHubWebhookAPI
+      StageName: prod
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GitHubDeployFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GitHubWebhookAPI}/*/POST/webhook
+
+Outputs:
+  WebhookURL:
+    Description: GitHub webhook URL to trigger Lambda on push
+    Value: !Sub https://${GitHubWebhookAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook
