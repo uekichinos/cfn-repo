@@ -1,6 +1,0 @@
-mkdir -p package
-pip install -r requirements.txt -t package
-cp index.py package/
-cd package
-zip -r ../receipt_lambda.zip .
-cd ..
